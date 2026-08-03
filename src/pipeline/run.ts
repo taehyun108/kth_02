@@ -1,0 +1,243 @@
+import type { TripQuery, GeoContext } from "@/agents/types";
+import type { VerifiedFact } from "@/core/types/verified-fact";
+import type {
+  Poi,
+  Restaurant,
+  WeatherDay,
+  CurrencyInfo,
+  FlightOption,
+  LogisticsInfo,
+} from "@/core/types/domains";
+import type { Itinerary, ItineraryDay } from "@/core/types/itinerary";
+import type { RoutePlan } from "@/agents/route-agent";
+import type { Place } from "@/planner/cluster";
+import { isRenderable } from "@/core/types/verified-fact";
+import { assembleDay, summarize, type DayAssemblyInput } from "@/planner/assemble";
+import { estimateBudget } from "@/planner/budget";
+import { planTransfers, type CityNode } from "@/agents/transfer-agent";
+import { dayCount, allocateNights } from "@/agents/schema";
+
+/**
+ * 파이프라인 의존성. 수집 에이전트는 내부에서 verifier 를 거쳐 VerifiedFact 를
+ * 반환한다. planner(assemble)/budget 은 여기서 걸러진 '검증 통과' 데이터만 본다(§2).
+ * resolveContext 는 도시명 단위로 호출된다(다중 도시).
+ */
+export interface PipelineDeps {
+  resolveContext: (city: string, q: TripQuery) => Promise<GeoContext>;
+  collectPois: (ctx: GeoContext, q: TripQuery) => Promise<VerifiedFact<Poi>[]>;
+  collectFood: (ctx: GeoContext, q: TripQuery) => Promise<VerifiedFact<Restaurant>[]>;
+  collectCurrency: (ctx: GeoContext) => Promise<VerifiedFact<CurrencyInfo>>;
+  collectWeather: (ctx: GeoContext, startDate: string, endDate: string) => Promise<VerifiedFact<WeatherDay>[]>;
+  collectFlights: (ctx: GeoContext, q: TripQuery) => Promise<VerifiedFact<FlightOption>[]>;
+  collectLogistics: (ctx: GeoContext, q: TripQuery) => Promise<VerifiedFact<LogisticsInfo>>;
+  buildRoute: (places: Place[], days: number, mode: TripQuery["transport"][number]) => Promise<RoutePlan>;
+}
+
+interface CityBundle {
+  city: string;
+  ctx: GeoContext | null;
+  days: ItineraryDay[];
+  pois: VerifiedFact<Poi>[];
+  food: VerifiedFact<Restaurant>[];
+  weather: VerifiedFact<WeatherDay>[];
+}
+
+export async function runPipeline(query: TripQuery, deps: PipelineDeps): Promise<Itinerary> {
+  const notes: string[] = [];
+  const nDays = dayCount(query.start_date, query.end_date);
+  const cityNames = query.destinations;
+  const alloc = allocateNights(nDays, cityNames.length); // 도시별 일수
+  const primaryMode = query.transport[0] ?? "transit";
+
+  // 도시별 시작 인덱스(전역 날짜 오프셋)
+  const startIndex: number[] = [];
+  alloc.reduce((acc, n, i) => ((startIndex[i] = acc), acc + n), 0);
+
+  // 도시별 병렬 처리
+  const bundles = await Promise.all(
+    cityNames.map((city, ci) => buildCity(query, deps, city, startIndex[ci]!, alloc[ci]!, primaryMode)),
+  );
+
+  const resolved = bundles.filter((b) => b.ctx !== null);
+  if (resolved.length === 0) {
+    return emptyItinerary(
+      query,
+      nDays,
+      cityNames,
+      "목적지 컨텍스트(좌표/통화)를 조회하지 못해 일정을 생성할 수 없습니다. (이 환경은 외부 API 접근이 차단되어 있습니다)",
+    );
+  }
+
+  const firstCtx = resolved[0]!.ctx!;
+
+  // 국가 단위 정보(통화/입국정보) + 출발지 항공: 한 번만
+  const [currency, logistics, flights] = await Promise.all([
+    safe(() => deps.collectCurrency(firstCtx), null),
+    safe(() => deps.collectLogistics(firstCtx, query), null),
+    safe(() => deps.collectFlights(firstCtx, query), [] as VerifiedFact<FlightOption>[]),
+  ]);
+
+  const days = bundles.flatMap((b) => b.days);
+  const allPois = bundles.flatMap((b) => b.pois);
+  const allFood = bundles.flatMap((b) => b.food);
+  const weather = bundles.flatMap((b) => b.weather);
+
+  if (allPois.filter(isRenderable).length === 0) {
+    notes.push("검증을 통과한 관광지가 없어 일부/전체 일정이 비어 있습니다. (외부 출처 조회 불가 또는 교차검증 실패)");
+  }
+  for (const b of bundles) {
+    if (b.ctx === null) notes.push(`'${b.city}' 컨텍스트 조회 실패로 해당 도시 일정을 비웠습니다.`);
+  }
+
+  // 도시 간 이동방법
+  const cityNodes: CityNode[] = resolved.map((b) => ({ name: b.city, center: b.ctx!.center }));
+  const transfers = planTransfers(cityNodes);
+
+  // 예산 (검증 통과 데이터만 사용)
+  const budget = estimateBudget({
+    currency,
+    pois: allPois.filter(isRenderable),
+    food: allFood.filter(isRenderable),
+    transfers,
+    flights,
+    days: nDays,
+    nights: Math.max(nDays - 1, 0),
+    party: query.party,
+  });
+
+  const allFacts: VerifiedFact<unknown>[] = [
+    ...allPois,
+    ...allFood,
+    ...weather,
+    ...flights,
+    ...(currency ? [currency] : []),
+    ...(logistics ? [logistics] : []),
+  ];
+
+  return {
+    query,
+    destination_center: firstCtx.center,
+    cities: resolved.map((b) => ({ name: b.city, center: b.ctx!.center })),
+    days,
+    transfers,
+    budget,
+    currency,
+    weather,
+    logistics,
+    flights,
+    verification_summary: summarize(allFacts),
+    notes,
+  };
+}
+
+/** 한 도시의 일정/데이터를 조립한다. 컨텍스트 실패 시 빈 날짜 블록을 돌려준다. */
+async function buildCity(
+  query: TripQuery,
+  deps: PipelineDeps,
+  city: string,
+  startDayIndex: number,
+  block: number,
+  primaryMode: TripQuery["transport"][number],
+): Promise<CityBundle> {
+  const dates = Array.from({ length: block }, (_, i) => addDays(query.start_date, startDayIndex + i));
+
+  const ctx = await safe(() => deps.resolveContext(city, query), null);
+  if (!ctx) {
+    return { city, ctx: null, pois: [], food: [], weather: [], days: dates.map((d) => emptyDay(d, city)) };
+  }
+
+  const [pois, food, weather] = await Promise.all([
+    safe(() => deps.collectPois(ctx, query), [] as VerifiedFact<Poi>[]),
+    safe(() => deps.collectFood(ctx, query), [] as VerifiedFact<Restaurant>[]),
+    safe(
+      () => deps.collectWeather(ctx, dates[0]!, dates[dates.length - 1]!),
+      [] as VerifiedFact<WeatherDay>[],
+    ),
+  ]);
+
+  const renderablePois = pois.filter(isRenderable);
+  const renderableFood = food.filter(isRenderable);
+  const places: Place[] = renderablePois.map((f, i) => ({ id: `${city}-poi-${i}`, location: f.value.location }));
+  const route = places.length > 0
+    ? await deps.buildRoute(places, block, primaryMode)
+    : { days: [], estimated: true, source_name: "" };
+  const poiById = new Map(places.map((p, i) => [p.id, renderablePois[i]!] as const));
+  const foodQueue = [...renderableFood];
+
+  const days: ItineraryDay[] = dates.map((date, localIdx) => {
+    const weekday = new Date(date + "T00:00:00Z").getUTCDay();
+    const dayRoute = route.days[localIdx];
+    const orderedPois = (dayRoute?.ordered_place_ids ?? []).map((id) => poiById.get(id)!).filter(Boolean);
+    const legMinutes = (dayRoute?.leg_seconds ?? orderedPois.map(() => 0)).map((s) => Math.round(s / 60));
+    const input: DayAssemblyInput = {
+      date,
+      weekday,
+      city,
+      pois: orderedPois,
+      legMinutes,
+      legMode: primaryMode,
+      legEstimated: route.estimated,
+      legSource: route.source_name || "n/a",
+      ...(foodQueue.length > 0 ? { lunch: foodQueue.shift()! } : {}),
+      ...(foodQueue.length > 0 ? { dinner: foodQueue.shift()! } : {}),
+    };
+    return assembleDay(input);
+  });
+
+  return { city, ctx, pois, food, weather, days };
+}
+
+function emptyDay(date: string, city: string): ItineraryDay {
+  return {
+    date,
+    weekday: new Date(date + "T00:00:00Z").getUTCDay(),
+    city,
+    items: [],
+    total_activity_minutes: 0,
+    total_travel_minutes: 0,
+    travel_ratio: 0,
+    warnings: [],
+  };
+}
+
+function emptyItinerary(query: TripQuery, nDays: number, cityNames: string[], note: string): Itinerary {
+  const days: ItineraryDay[] = [];
+  const alloc = allocateNights(nDays, cityNames.length);
+  let idx = 0;
+  cityNames.forEach((city, ci) => {
+    for (let i = 0; i < alloc[ci]!; i++) days.push(emptyDay(addDays(query.start_date, idx++), city));
+  });
+  return {
+    query,
+    destination_center: { lat: 0, lng: 0 },
+    cities: [],
+    days,
+    transfers: [],
+    budget: {
+      currency: null,
+      lines: [],
+      total_krw: 0,
+      verified_krw: 0,
+      per_person_krw: 0,
+      note: "데이터 부족으로 예산을 산출하지 못했습니다.",
+    },
+    currency: null,
+    weather: [],
+    logistics: null,
+    flights: [],
+    verification_summary: { high: 0, medium: 0, low: 0, total: 0, high_ratio: 0 },
+    notes: [note],
+  };
+}
+
+function addDays(date: string, d: number): string {
+  return new Date(Date.parse(date) + d * 86_400_000).toISOString().slice(0, 10);
+}
+
+async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    return fallback;
+  }
+}
